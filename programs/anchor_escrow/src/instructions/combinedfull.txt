@@ -1,0 +1,610 @@
+/* ------------------------------------------------
+My anchor_escrow/programs/anchor_escrow/src/instructions/make.rs is as follows:
+--------------------------------------------------- */
+Current date: Saturday, January 25, 2025, 06 PM UTC
+
+use anchor_lang::prelude::*;
+use anchor_spl::{ 
+    associated_token::AssociatedToken, 
+    token_interface::{TransferChecked, transfer_checked, Mint, TokenAccount, TokenInterface}
+    };
+use crate::state::escrow;
+use crate::Escrow;
+
+
+#[derive(Accounts)]
+#[instruction(seed: u64)] // this allows a user to have more than 1 escrow otherwise it will throw error if user try to create another escrow
+pub struct Make<'info> {
+    #[account(mut)]
+    pub maker: Signer<'info>,  // The user initiating the escrow who signs the transaction. The signer must be this user, approving the transaction's terms and authorizing the transfer of funds
+    pub mint_a: InterfaceAccount<'info, Mint>,
+    pub mint_b: InterfaceAccount<'info, Mint>,
+    #[account(
+        mut,
+        associated_token::mint = mint_a,
+        associated_token::authority = maker,
+    )]
+    pub maker_ata_a: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        init,
+        payer = maker,
+        seeds = [b"escrow", maker.key().as_ref(), seed.to_le_bytes().as_ref()], // escrow is a word we give, we can use anyother word too
+        bump,
+        space = 8 + Escrow:: INIT_SPACE,
+
+    )]
+
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(
+        init,
+        payer = maker,
+        associated_token::mint = mint_a,
+        associated_token::authority = escrow,
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>, // this program owns associated token account
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>
+}
+
+impl<'info> Make<'info> {
+    pub fn init_escrow(&mut self, seed: u64, recieve: u64, bumps: &MakeBumps) -> Result<()> { // This function is designed to initialize or update the escrow account with necessary parameters to establish the conditions under which the escrow operates
+
+        self.escrow.set_inner(Escrow { 
+            seed,
+            maker: self.maker.key(),
+            mint_a: self.mint_a.key(),
+            mint_b: self.mint_b.key(),
+            recieve,
+            bump: bumps.escrow,  // The bump seed is included to ensure that the address of the escrow account is derived securely 
+        });
+        Ok(())
+    }
+
+    pub fn deposit(&mut self, deposit: u64) {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.maker_ata_a.to_account_info(),
+            to: self.vault.to_account_info(),
+            authority: self.maker.to_account_info(),
+            mint: self.mint_a.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_account);
+        transfer_checked(cpi_ctx, deposit, self.mint_a.decimals);
+        
+    }
+
+}
+/* ------------------------------------------------
+My anchor_escrow/programs/anchor_escrow/src/instructions/mod.rs is as follows:
+--------------------------------------------------- */
+Current date: Saturday, January 25, 2025, 06 PM UTC
+
+pub mod make;
+pub use make::*;
+
+pub mod take;
+pub use take::*;
+
+pub mod refund;
+pub use refund::*;
+
+
+/* ------------------------------------------------
+My anchor_escrow/programs/anchor_escrow/src/instructions/refund.rs is as follows:
+--------------------------------------------------- */
+Current date: Saturday, January 25, 2025, 06 PM UTC
+
+use anchor_lang::prelude::*;
+
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token_interface::{
+        close_account, transfer_checked, CloseAccount, Mint, TokenAccount, TokenInterface,
+        TransferChecked,
+    },
+};
+
+use crate::Escrow;
+
+#[derive(Accounts)]
+#[instruction(seed: u64)]
+pub struct Refund<'info> {
+    
+    #[account(mut)] // The acount of the maker who initiates the refund   // Must a signer to authorize the refund
+    pub maker: Signer<'info>,
+    pub mint_a: InterfaceAccount<'info, Mint>,     // The mint of the token that was initially deposited into the escrow by the maker
+    
+    #[account(   // The maker's associated token account for Mint A, where tokens will be refunded to
+        mut,
+        associated_token::mint = mint_a,
+        associated_token::authority = maker,
+        associated_token::token_program = token_program
+    )]
+    maker_ata_a: InterfaceAccount<'info, TokenAccount>,
+
+    // The escrow account holding the state and terms of the escrow, including the seed and associated tokens
+    // This account will be closed, and its remaining balance will be refunded to the maker
+    #[account(
+        mut,
+        close = maker, 
+        seeds = [b"escrow", maker.key().as_ref(), escrow.seed.to_le_bytes().as_ref()], 
+        bump = escrow.bump,
+        constraint = (maker.key() == escrow.maker.key()),
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    /// The vault account where the tokens from the maker were deposited and held during the escrow
+    /// Tokens will be transferred back to the maker and account closed
+    #[account(
+        mut,
+        associated_token::mint = mint_a,
+        associated_token::authority = escrow,
+        associated_token::token_program = token_program
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>, // SPL Associated Token Program used for handling operations on associated token accounts
+    pub token_program: Interface<'info, TokenInterface>,  // SPL Token Program used for tokens transfers and other token operations
+    pub system_program: Program<'info, System>,  // Solana System Program used for account creation, lamports transfer, etc.
+}
+
+impl<'info> Refund<'info> {
+    pub fn refund(&mut self) -> Result<()> {
+
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        // Set up the transfer checked call to move tokens from the vault back to the maker's ATA
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.vault.to_account_info(),
+            to: self.maker_ata_a.to_account_info(),
+            mint: self.mint_a.to_account_info(),
+            authority: self.escrow.to_account_info(),
+        };
+
+        // Execute the transfer checked operaiton, transfrering any remaining SOL to the maker
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_account);
+        let amount = self.vault.amount;
+        transfer_checked(cpi_ctx, amount, self.mint_a.decimals)?;
+        Ok(())
+    }
+    pub fn close_refund(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        // Set up the closing of the vault account, transferring any remaining SOL to the maker
+        let cpi_account: CloseAccount<'_> = CloseAccount {
+            account: self.vault.to_account_info(),
+            destination: self.maker.to_account_info(),
+            authority: self.escrow.to_account_info(),
+        };
+        // Prepare the signer seeds for authorizig operations with the escrow's PDA
+        let signer_seeds: [&[&[u8]]; 1] = [&[
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+        // Execute the account closure using the signer seeds
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program,
+            cpi_account,
+            &signer_seeds,
+        );
+        close_account(cpi_ctx);
+        Ok(())
+    }
+}
+/* ------------------------------------------------
+My anchor_escrow/programs/anchor_escrow/src/instructions/take.rs is as follows:
+--------------------------------------------------- */
+Current date: Saturday, January 25, 2025, 06 PM UTC
+
+use anchor_lang::prelude::*;
+use anchor_spl::{self, 
+    associated_token::AssociatedToken, 
+    token_interface::{TransferChecked, transfer_checked, CloseAccount, close_account, Mint, TokenAccount, TokenInterface}
+    };
+use crate::state::escrow;
+use crate::Escrow;
+
+#[derive(Accounts)]
+#[instruction(seed: u64)]
+pub struct Take<'info> {
+    #[account(mut)]
+    pub taker: Signer<'info>,
+    pub maker: SystemAccount<'info>,
+    pub mint_a: InterfaceAccount<'info, Mint>,
+    pub mint_b: InterfaceAccount<'info, Mint>,
+    #[account(
+        init_if_needed,
+        payer = taker,
+        associated_token::mint =mint_a,
+        associated_token::authority = taker,
+    )]
+    pub taker_ata_a: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint =mint_b,
+        associated_token::authority = taker,
+    )]
+    pub taker_ata_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = taker, 
+        associated_token::mint =mint_b,
+        associated_token::authority = maker,
+    )]
+    pub maker_ata_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        close = maker, 
+        has_one = mint_b,
+        has_one = mint_a,
+        has_one = maker,
+        seeds = [b"escrow", maker.key().as_ref(), seed.to_le_bytes().as_ref()], 
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+    
+    #[account(
+        mut,
+        associated_token::mint =mint_a,
+        associated_token::authority = escrow,
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+
+}
+
+impl<'info> Take<'info> {
+    pub fn deposit(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.taker_ata_b.to_account_info(),
+            to: self.maker_ata_b.to_account_info(),
+            authority: self.taker.to_account_info(),
+            mint: self.mint_b.to_account_info(),
+
+        };
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_account);
+        transfer_checked(cpi_ctx, self.escrow.recieve, self.mint_b.decimals)?;
+        Ok(())
+    }
+    
+    pub fn withdraw(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.vault.to_account_info(),
+            to: self.taker_ata_a.to_account_info(),
+            authority: self.escrow.to_account_info(),
+            mint: self.mint_a.to_account_info(),
+
+        };
+
+        let signer_seeds: [&[&[u8]]; 1] = [&[ 
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_account, &signer_seeds);
+        transfer_checked(cpi_ctx, self.vault.amount, self.mint_a.decimals)?;
+        Ok(())
+    }
+    pub fn close(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: CloseAccount<'_> = CloseAccount {
+            account: self.vault.to_account_info(),
+            destination: self.taker.to_account_info(),
+            authority: self.escrow.to_account_info(),
+
+        };
+
+        let signer_seeds: [&[&[u8]]; 1] = [&[ 
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_account, &signer_seeds);
+        close_account(cpi_ctx)?;
+        Ok(())
+    }
+}use anchor_lang::prelude::*;
+use anchor_spl::{self, 
+    associated_token::AssociatedToken, 
+    token_interface::{TransferChecked, transfer_checked, CloseAccount, close_account, Mint, TokenAccount, TokenInterface}
+    };
+use crate::state::escrow;
+use crate::Escrow;
+
+#[derive(Accounts)]
+#[instruction(seed: u64)]
+pub struct Take<'info> {
+    #[account(mut)]
+    pub taker: Signer<'info>,
+    pub maker: SystemAccount<'info>,
+    pub mint_a: InterfaceAccount<'info, Mint>,
+    pub mint_b: InterfaceAccount<'info, Mint>,
+    #[account(
+        init_if_needed,
+        payer = taker,
+        associated_token::mint =mint_a,
+        associated_token::authority = taker,
+    )]
+    pub taker_ata_a: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint =mint_b,
+        associated_token::authority = taker,
+    )]
+    pub taker_ata_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = taker, 
+        associated_token::mint =mint_b,
+        associated_token::authority = maker,
+    )]
+    pub maker_ata_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        close = maker, 
+        has_one = mint_b,
+        has_one = mint_a,
+        has_one = maker, 
+        seeds = [b"escrow", maker.key().as_ref(), seed.to_le_bytes().as_ref()], 
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+    
+    #[account(
+        mut,
+        associated_token::mint =mint_a,
+        associated_token::authority = escrow,
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+
+}
+
+impl<'info> Take<'info> {
+    pub fn deposit(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.taker_ata_b.to_account_info(),
+            to: self.maker_ata_b.to_account_info(),
+            authority: self.taker.to_account_info(),
+            mint: self.mint_b.to_account_info(),
+
+        };
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_account);
+        transfer_checked(cpi_ctx, self.escrow.recieve, self.mint_b.decimals)?;
+        Ok(())
+    }
+    
+    pub fn withdraw(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.vault.to_account_info(),
+            to: self.taker_ata_a.to_account_info(),
+            authority: self.escrow.to_account_info(),
+            mint: self.mint_a.to_account_info(),
+
+        };
+
+        let signer_seeds: [&[&[u8]]; 1] = [&[ 
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_account, &signer_seeds);
+        transfer_checked(cpi_ctx, self.vault.amount, self.mint_a.decimals)?;
+        Ok(())
+    }
+    pub fn close(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: CloseAccount<'_> = CloseAccount {
+            account: self.vault.to_account_info(),
+            destination: self.taker.to_account_info(),
+            authority: self.escrow.to_account_info(),
+
+        };
+
+        let signer_seeds: [&[&[u8]]; 1] = [&[ 
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_account, &signer_seeds);
+        close_account(cpi_ctx)?;
+        Ok(())
+    }
+}use anchor_lang::prelude::*;
+use anchor_spl::{self, 
+    associated_token::AssociatedToken, 
+    token_interface::{TransferChecked, transfer_checked, CloseAccount, close_account, Mint, TokenAccount, TokenInterface}
+    };
+use crate::state::escrow;
+use crate::Escrow;
+
+#[derive(Accounts)]
+#[instruction(seed: u64)]
+pub struct Take<'info> {
+    #[account(mut)]
+    pub taker: Signer<'info>,
+    pub maker: SystemAccount<'info>,
+    pub mint_a: InterfaceAccount<'info, Mint>,
+    pub mint_b: InterfaceAccount<'info, Mint>,
+    #[account(
+        init_if_needed,
+        payer = taker,
+        associated_token::mint =mint_a,
+        associated_token::authority = taker,
+    )]
+    pub taker_ata_a: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint =mint_b,
+        associated_token::authority = taker,
+    )]
+    pub taker_ata_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = taker, 
+        associated_token::mint =mint_b,
+        associated_token::authority = maker,
+    )]
+    pub maker_ata_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        close = maker, 
+        has_one = mint_b,
+        has_one = maker, 
+        seeds = [b"escrow", maker.key().as_ref(), seed.to_le_bytes().as_ref()], 
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+    
+    #[account(
+        mut,
+        associated_token::mint =mint_a,
+        associated_token::authority = escrow,
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+
+}
+
+impl<'info> Take<'info> {
+    pub fn deposit(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.taker_ata_b.to_account_info(),
+            to: self.maker_ata_b.to_account_info(),
+            authority: self.taker.to_account_info(),
+            mint: self.mint_b.to_account_info(),
+
+        };
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_account);
+        transfer_checked(cpi_ctx, self.escrow.recieve, self.mint_b.decimals)?;
+        Ok(())
+    }
+    
+    pub fn withdraw(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: TransferChecked<'_> = TransferChecked {
+            from: self.vault.to_account_info(),
+            to: self.taker_ata_a.to_account_info(),
+            authority: self.escrow.to_account_info(),
+            mint: self.mint_a.to_account_info(),
+
+        };
+
+        let signer_seeds: [&[&[u8]]; 1] = [&[ 
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_account, &signer_seeds);
+        transfer_checked(cpi_ctx, self.vault.amount, self.mint_a.decimals)?;
+        Ok(())
+    }
+    pub fn close(&mut self) -> Result<()> {
+        let cpi_program: AccountInfo<'_> = self.token_program.to_account_info();
+        let cpi_account: CloseAccount<'_> = CloseAccount {
+            account: self.vault.to_account_info(),
+            destination: self.taker.to_account_info(),
+            authority: self.escrow.to_account_info(),
+
+        };
+
+        let signer_seeds: [&[&[u8]]; 1] = [&[ 
+            b"escrow",
+            self.maker.to_account_info().key.as_ref(),
+            &self.escrow.seed.to_le_bytes()[..],
+            &[self.escrow.bump],
+        ]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_account, &signer_seeds);
+        close_account(cpi_ctx)?;
+        Ok(())
+    }
+}
+/* ------------------------------------------------
+My anchor_escrow/programs/anchor_escrow/src/state/escrow.rs is as follows:
+--------------------------------------------------- */
+Current date: Saturday, January 25, 2025, 06 PM UTC
+
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct Escrow {
+    pub seed: u64,
+    pub maker: Pubkey,
+    pub mint_a: Pubkey,
+    pub mint_b: Pubkey,
+    pub recieve_amount: u64,
+    pub bump: u8,
+}       
+
+/* ------------------------------------------------
+My anchor_escrow/programs/anchor_escrow/src/state/mod.rs is as follows:
+--------------------------------------------------- */
+
+
+pub mod escrow;
+pub use escrow::*;
+
+/* ------------------------------------------------
+My anchor_escrow/programs/anchor_escrow/src/lib.rs is as follows:
+
+use anchor_lang::prelude::*;
+
+declare_id!("73bhLRuwcNwd7prQnWqGrSARy5ozmKykGEUBPzwCSGgS");
+
+pub mod state;
+use state::*;
+pub mod instructions;
+use instructions::*;
+
+#[program]
+pub mod anchor_escrow {
+    use super::*;
+    pub fn make(ctx: Context<Make>, seed: u64, deposit: u64, receive: u64) -> Result<()> {
+        ctx.accounts.deposit(deposit);
+        ctx.accounts.init_escrow(seed, receive, &ctx.bumps)
+    } 
+    
+    pub fn take(ctx: Context<Take>) -> Result<()> {
+        ctx.accounts.deposit()?;
+        ctx.accounts.withdraw()?;
+        ctx.accounts.close()?;
+        Ok(())
+    }
+    pub fn refund(ctx: Context<Refund>) -> Result<()> {
+        ctx.accounts.refund()?;
+        ctx.accounts.close_refund()?;
+        Ok(())
+    }   
+}

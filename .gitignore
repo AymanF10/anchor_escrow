@@ -5,3 +5,6 @@ target
 node_modules
 test-ledger
 .yarn
+concat_files.sh
+combinefull.txt
+
